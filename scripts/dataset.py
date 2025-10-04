@@ -113,12 +113,22 @@ class CalorieDataset(Dataset):
             return_tensors='pt'
         )
         
+        # Новый таргет: калории на 100г (более стабильная метрика)
+        calories_per_100g = row['total_calories'] / (row['total_mass'] / 100.0)
+
+        # Устойчивое лог-нормализация массы для признака
+        mass_feature = np.log1p(row['total_mass']).astype(np.float32)
+
         return {
             'image': image,
             'text_input_ids': text_encoded['input_ids'].squeeze(0),
             'text_attention_mask': text_encoded['attention_mask'].squeeze(0),
-            'calories': torch.tensor(row['total_calories'], dtype=torch.float32),
+            # новый таргет
+            'calories_per_100g': torch.tensor(calories_per_100g, dtype=torch.float32),
+            # для обратного перевода
             'mass': torch.tensor(row['total_mass'], dtype=torch.float32),
+            # признак для модели
+            'mass_feature': torch.tensor(mass_feature, dtype=torch.float32),
             'dish_id': row['dish_id']
         }
     
@@ -159,16 +169,19 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     images = torch.stack([item['image'] for item in batch])
     text_input_ids = torch.stack([item['text_input_ids'] for item in batch])
     text_attention_masks = torch.stack([item['text_attention_mask'] for item in batch])
-    calories = torch.stack([item['calories'] for item in batch])
+    calories_per_100g = torch.stack(
+        [item['calories_per_100g'] for item in batch])
     masses = torch.stack([item['mass'] for item in batch])
+    mass_features = torch.stack([item['mass_feature'] for item in batch])
     dish_ids = [item['dish_id'] for item in batch]
     
     return {
         'images': images,
         'text_input_ids': text_input_ids,
         'text_attention_masks': text_attention_masks,
-        'calories': calories,
+        'calories_per_100g': calories_per_100g,
         'masses': masses,
+        'mass_features': mass_features,
         'dish_ids': dish_ids
     }
 

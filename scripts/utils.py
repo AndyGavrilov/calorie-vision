@@ -99,14 +99,23 @@ class CaloriePredictor(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
+        # MLP для массового признака
+        self.mass_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.3)
+        )
+
+        # Расширенный регрессор с учетом массы
+        fusion_dim = hidden_dim + hidden_dim + 32  # vision + text + mass
         self.regressor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(fusion_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate * 0.5),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout_rate * 0.3),
-            nn.Linear(hidden_dim // 4, 1)
+            nn.Linear(hidden_dim // 2, 1)
         )
         
         # Инициализация весов
@@ -127,18 +136,20 @@ class CaloriePredictor(nn.Module):
         self,
         images: torch.Tensor,
         text_input_ids: torch.Tensor,
-        text_attention_mask: torch.Tensor
+        text_attention_mask: torch.Tensor,
+        mass_features: torch.Tensor
     ) -> torch.Tensor:
         """
-        Forward pass модели.
+        Forward pass модели с поддержкой массового признака.
         
         Args:
             images: Тензор изображений [batch_size, channels, height, width]
             text_input_ids: Токены текста [batch_size, max_length]
             text_attention_mask: Маска внимания [batch_size, max_length]
+            mass_features: Лог-нормализованные массы [batch_size]
             
         Returns:
-            Предсказания калорий [batch_size, 1]
+            Предсказания калорий на 100г [batch_size]
         """
         # Vision processing
         vision_features = self.vision_encoder(images)  # [batch_size, vision_dim]
@@ -149,18 +160,21 @@ class CaloriePredictor(nn.Module):
             input_ids=text_input_ids,
             attention_mask=text_attention_mask
         )
-        # Для DistilBERT используем CLS токен из last_hidden_state
         text_features = text_output.last_hidden_state[:, 0, :]  # [batch_size, text_dim]
         text_proj = self.text_proj(text_features)  # [batch_size, hidden_dim]
         
-        # Fusion
-        fused = torch.cat([vision_proj, text_proj], dim=1)  # [batch_size, hidden_dim * 2]
-        fused = self.fusion(fused)  # [batch_size, hidden_dim]
+        # Mass processing
+        # [batch_size, 1] -> [batch_size, 32]
+        mass_emb = self.mass_mlp(mass_features.unsqueeze(1))
+
+        # Fusion всех компонентов
+        # [batch_size, hidden_dim * 2 + 32]
+        fused = torch.cat([vision_proj, text_proj, mass_emb], dim=1)
         
         # Regression
-        calories_pred = self.regressor(fused)  # [batch_size, 1]
+        calories_pred_per_100g = self.regressor(fused)  # [batch_size, 1]
         
-        return calories_pred.squeeze(-1)  # [batch_size]
+        return calories_pred_per_100g.squeeze(-1)  # [batch_size]
 
 
 def create_optimizer_and_scheduler(
@@ -191,13 +205,20 @@ def create_optimizer_and_scheduler(
     
     optimizer = AdamW(param_groups, weight_decay=config['weight_decay'])
     
-    # Обучающийся планировщик learning rate
-    scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=config['scheduler_T_0'],
-        T_mult=config['scheduler_T_mult'],
-        eta_min=config['scheduler_eta_min']
-    )
+    # Новый планировщик: warmup + cosine annealing без рестартов
+    import math
+    warmup_epochs = config.get('warmup_epochs', 5)
+    min_lr = config.get('min_lr', 1e-6)
+    total_epochs = config['epochs']
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        # Линейное соотнесение к косинусу без рестартов
+        t = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1 + math.cos(math.pi * t))  # от 1 до 0
+
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     return optimizer, scheduler
 
@@ -240,13 +261,18 @@ def train_epoch(
         images = batch['images'].to(device)
         text_input_ids = batch['text_input_ids'].to(device)
         text_attention_mask = batch['text_attention_masks'].to(device)
-        calories_true = batch['calories'].to(device)
+        calories_per_100g_true = batch['calories_per_100g'].to(device)
+        mass_features = batch['mass_features'].to(device)
         
         # Forward pass
-        calories_pred = model(images, text_input_ids, text_attention_mask)
+        calories_pred_per_100g = model(
+            images, text_input_ids, text_attention_mask, mass_features)
         
-        # Вычисление потерь
-        loss = criterion(calories_pred, calories_true)
+        # Новый лосс: MAE + 0.2*MSE для лучшей сходимости
+        import torch.nn.functional as F
+        mae_loss = F.l1_loss(calories_pred_per_100g, calories_per_100g_true)
+        mse_loss = F.mse_loss(calories_pred_per_100g, calories_per_100g_true)
+        loss = mae_loss + 0.2 * mse_loss
         
         # Backward pass
         (loss / accumulate_steps).backward()
@@ -257,9 +283,13 @@ def train_epoch(
             optimizer.step()
             optimizer.zero_grad()
         
-        # Статистика
+        # Статистика - конверсия в общие калории для понятных метрик
         with torch.no_grad():
-            mae = F.l1_loss(calories_pred, calories_true).item()
+            # Конвертируем калории на 100г обратно в общие калории для метрики
+            masses = batch['masses'].to(device)
+            calories_pred_total = calories_pred_per_100g * (masses / 100.0)
+            calories_true_total = calories_per_100g_true * (masses / 100.0)
+            mae = F.l1_loss(calories_pred_total, calories_true_total).item()
         
         total_loss += loss.item()
         total_mae += mae
@@ -308,15 +338,28 @@ def validate_epoch(
             images = batch['images'].to(device)
             text_input_ids = batch['text_input_ids'].to(device)
             text_attention_mask = batch['text_attention_masks'].to(device)
-            calories_true = batch['calories'].to(device)
+            calories_per_100g_true = batch['calories_per_100g'].to(device)
+            masses = batch['masses'].to(device)
+            mass_features = batch['mass_features'].to(device)
             
             # Forward pass
-            calories_pred = model(images, text_input_ids, text_attention_mask)
+            calories_pred_per_100g = model(
+                images, text_input_ids, text_attention_mask, mass_features)
+
+            # Конвертация обратно в общие калории для валидации
+            calories_pred_total = calories_pred_per_100g * (masses / 100.0)
+            calories_true_total = calories_per_100g_true * (masses / 100.0)
             
             # Вычисление метрик
-            loss = criterion(calories_pred, calories_true)
-            mae = F.l1_loss(calories_pred, calories_true).item()
-            mse = F.mse_loss(calories_pred, calories_true).item()
+            mae_loss = F.l1_loss(calories_pred_per_100g,
+                                 calories_per_100g_true)
+            mse_loss = F.mse_loss(calories_pred_per_100g,
+                                  calories_per_100g_true)
+            loss = mae_loss + 0.2 * mse_loss
+
+            # Метрики в общих калориях для понятности
+            mae = F.l1_loss(calories_pred_total, calories_true_total).item()
+            mse = F.mse_loss(calories_pred_total, calories_true_total).item()
             
             total_loss += loss.item()
             total_mae += mae

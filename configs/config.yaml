@@ -1,0 +1,91 @@
+# Конфигурация для обучения модели предсказания калорийности блюд
+
+# === ОСНОВНЫЕ ПАРАМЕТРЫ ===
+seed: 42
+output_dir: "models"
+device: "auto"  # auto/cuda/cpu
+
+# === МОДЕЛИ ===
+vision_model: "efficientnet_b3"  # timm model name
+text_model: "bert-base-uncased"  # transformers model name
+
+# === АРХИТЕКТУРА ===
+hidden_dim: 768           # Увеличено для большей мощности модели
+dropout_rate: 0.3         # Уменьшено для менее агрессивной регуляризации
+image_size: 224           # Оптимальный баланс скорость/качество
+
+# === ОБУЧЕНИЕ ===
+epochs: 50               # Уменьшено для фокуса на качестве
+batch_size: 12           # Компромисс скорость/стабильность
+num_workers: 0           # 0 для Windows, 4 для Linux
+
+# Learning rates для разных компонентов (ИСПРАВЛЕННЫЕ НАСТРОЙКИ)
+vision_lr: 0.0001        # ИСПРАВЛЕНО: было критически мало 1e-6!
+text_lr: 0.00003          # Оптимальный LR для BERT
+fusion_lr: 0.001          # Высокий LR для новых слоев
+
+# === ОПТИМИЗАЦИЯ ===
+weight_decay: 0.01        # Уменьшено для менее агрессивной L2 регуляризации
+grad_clip: 1.0            # Уменьшено для менее агрессивного клиппинга градиентов
+
+# Планировщик Learning Rate (БОЛЕЕ АДАПТИВНЫЙ)
+scheduler_T_0: 15         # Больше эпох между перезапусками
+scheduler_T_mult: 2       # Экспоненциальное увеличение периода
+scheduler_eta_min: 0.00000001 # Немного выше минимальный LR для предотвращения застревания
+
+# === РАННЯЯ ОСТАНОВКА ===
+early_stopping_patience: 20  # Больше терпения для длительного обучения
+
+# === ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ ОБУЧЕНИЯ ===
+text_max_length: 128         # Сокращено для ускорения
+accumulate_steps: 2          # Уменьшено для ускорения
+freeze_vision_epochs: 5      # Больше эпох заморозки для стабильности
+freeze_text_epochs: 0        # Эпохи заморозки text encoder
+
+# === АУГМЕНТАЦИИ === (УЛУЧШЕННЫЕ ПО ТЕОРИИ)
+augmentation:
+  # Настройка разрешения изображений
+  image_size: 224
+  # Умеренные геометрические трансформации (исправлено)
+  affine_prob: 0.6
+  affine_scale: [0.9, 1.1]          # Меньше зума чтобы не ломать объекты
+  affine_translate: [-0.05, 0.05]    # Меньше сдвига
+  
+  # Базовые аугментации (сохранены)
+  horizontal_flip_prob: 0.5
+  
+  # Умеренные цветовые изменения (исправлено)
+  color_jitter_brightness: 0.2       # Уменьшено с 0.4
+  color_jitter_contrast: 0.2         # Уменьшено с 0.4
+  color_jitter_saturation: 0.2       # Уменьшено с 0.4
+  color_jitter_hue: 0.1              # Уменьшено с 0.15
+  color_jitter_prob: 0.7             # Уменьшено с 0.9
+  
+  # Геометрия
+  rotation_range: [-10, 10]          # Уменьшено с ±15
+  
+  # Умеренное маскирование (исправлено)
+  coarse_dropout_prob: 0.3           # Уменьшено с 0.5
+  coarse_dropout_holes_range: [1, 4] # Меньше дыр
+  
+  # Минимум эластичности
+  elastic_transform_prob: 0.1         # Уменьшено с 0.3
+  
+  # Воспроизводимость
+  transform_seed: 42
+
+# === ПУТИ К ДАННЫМ ===
+data_paths:
+  dish_csv: "data/dish.csv"
+  ingredients_csv: "data/ingredients.csv"
+  images_dir: "data/images"
+
+# === МЕТРИКИ ЦЕЛЕВЫЕ ===
+target_mae: 50  # MAE должен быть меньше 50 ккал
+
+# === ЛОГИРОВАНИЕ ===
+logging:
+  log_every_n_steps: 10
+  save_checkpoints: true
+  checkpoint_interval: 5  # сохранять чекпоинт каждые N эпох
+

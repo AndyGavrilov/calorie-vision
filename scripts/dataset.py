@@ -1,18 +1,20 @@
 """Датасет для задачи предсказания калорийности блюд"""
 
 import os
+import warnings
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
-import timm
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from PIL import Image
-import numpy as np
-from transformers import AutoTokenizer
+import timm
 import albumentations as A
 import albumentations.pytorch as APT
-from typing import Dict, List, Tuple, Optional
-import warnings
+from transformers import AutoTokenizer
+
 warnings.filterwarnings('ignore')
 
 
@@ -53,7 +55,7 @@ class CalorieDataset(Dataset):
         
         # Создаем маппинг ID -> название ингредиента
         self.ingredient_mapping = dict(zip(
-            ingredients_df['id'].astype(str).str.zfill(11), 
+            ingredients_df['id'].astype(int),
             ingredients_df['ingr']
         ))
         
@@ -147,9 +149,13 @@ class CalorieDataset(Dataset):
         
         for ingr_id in ingredient_ids:
             # Извлекаем номер из ID
-            clean_id = str(int(ingr_id.replace('ingr_', '')))
-            if clean_id in self.ingredient_mapping:
-                ingredients.append(self.ingredient_mapping[clean_id])
+            id_str = ingr_id.replace('ingr_', '')
+            try:
+                key = int(id_str)
+            except:
+                key = None
+            if key in self.ingredient_mapping:
+                ingredients.append(self.ingredient_mapping[key])
             else:
                 ingredients.append("unknown ingredient")
         
@@ -198,15 +204,15 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
     Returns:
         Compose объект Albumentations
     """
-    # Автоматическое определение оптимального разрешения из модели (из теории)
+    # Автоматическое определение оптимального разрешения из модели
     try:
         cfg = timm.get_pretrained_cfg('efficientnet_b3')
         optimal_size = max(cfg.input_size[1], cfg.input_size[2])
-        print(f"📐 Оптимальное разрешение для EfficientNet-B3: {optimal_size}")
+        print(f"Оптимальное разрешение для EfficientNet-B3: {optimal_size}")
     except:
         optimal_size = image_size
     
-    # Дефолтные значения если конфиг не передан (обновленные на основе теории)
+    # Дефолтные значения если конфиг не передан
     if config is None:
         augmentation_config = {
             'image_size': image_size,
@@ -239,7 +245,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
             # Горизонтальное отражение
             A.HorizontalFlip(p=augmentation_config.get('horizontal_flip_prob', 0.5)),
             
-            # Мощные геометрические трансформации (из теории пользователя)
+            # Геометрические трансформации
             A.Affine(
                 scale=augmentation_config.get('affine_scale', (0.8, 1.2)),
                 rotate=augmentation_config.get('rotation_range', [-15, 15]),
@@ -249,7 +255,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
                 p=augmentation_config.get('affine_prob', 0.8)
             ),
             
-            # Агрессивные цветовые трансформации
+            # Цветовые трансформации
             A.ColorJitter(
                 brightness=augmentation_config.get('color_jitter_brightness', 0.4),
                 contrast=augmentation_config.get('color_jitter_contrast', 0.4),
@@ -258,7 +264,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
                 p=augmentation_config.get('color_jitter_prob', 0.9)
             ),
             
-            # Умный CoarseDropout с переменным количеством дыр (из теории)
+            # CoarseDropout с переменным количеством дыр
             A.CoarseDropout(
                 num_holes_range=augmentation_config.get('coarse_dropout_holes_range', (2, 8)),
                 hole_height_range=augmentation_config.get('coarse_dropout_height_range', 
@@ -269,7 +275,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
                 p=augmentation_config.get('coarse_dropout_prob', 0.5)
             ),
             
-            # Эластичные искажения (менее агрессивно)
+            # Эластичные искажения
             A.ElasticTransform(
                 p=augmentation_config.get('elastic_transform_prob', 0.3)
             ),
@@ -280,7 +286,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
                 std=[0.229, 0.224, 0.225]   # ImageNet std
             ),
             APT.ToTensorV2()  # Преобразование в тензор
-        ], seed=augmentation_config.get('transform_seed', 42))  # Seed для воспроизводимости
+        ], seed=augmentation_config.get('transform_seed', 42)) 
     else:
         # Валидация/тест: только resize и normalize, без аугментаций
         transforms = A.Compose([
@@ -291,7 +297,7 @@ def get_transforms(mode: str = "train", image_size: int = 224, config: dict = No
                 std=[0.229, 0.224, 0.225]
             ),
             APT.ToTensorV2()
-        ], seed=augmentation_config.get('transform_seed', 42))  # Seed для воспроизводимости
+        ], seed=augmentation_config.get('transform_seed', 42))
     
     return transforms
 
@@ -337,7 +343,7 @@ def create_data_loaders(
         ingredients_df=ingredients_df,
         image_dir=image_dir,
         transforms=get_transforms(mode="val", image_size=image_size, config=config),
-        mode="test",  # Используем test сплит для валидации
+        mode="test",
         tokenizer_name=config.get('text_model') if config else None,
         text_max_length=config.get('text_max_length', 256) if config else 256
     )

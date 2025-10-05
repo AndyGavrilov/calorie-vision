@@ -74,14 +74,14 @@ def main():
         # Проверка достижения цели
         target_mae = 50.0
         if metrics['val_mae'] < target_mae:
-            print(f"✅ ЦЕЛЬ ДОСТИГНУТА! MAE < {target_mae} ккал")
+            print(f"ЦЕЛЬ ДОСТИГНУТА! MAE < {target_mae} ккал")
         else:
-            print(f"❌ Цель НЕ достигнута. MAE >= {target_mae} ккал")
+            print(f"Цель НЕ достигнута. MAE >= {target_mae} ккал")
         
         print("=" * 60)
         
     except Exception as e:
-        print(f"\n❌ ОШИБКА ОБУЧЕНИЯ: {e}")
+        print(f"\nОШИБКА ОБУЧЕНИЯ: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

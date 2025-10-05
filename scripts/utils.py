@@ -1,24 +1,108 @@
 """Утилиты для обучения модели предсказания калорийности блюд"""
 
+import math
 import os
 import random
+import sys
 import time
-from functools import partial
+from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import numpy as np
+import pandas as pd
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW, lr_scheduler
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoTokenizer
-import timm
-import torchmetrics
-import yaml
 from tqdm import tqdm
+from transformers import AutoModel
+import yaml
 
 from scripts.dataset import create_data_loaders
+
+try:
+    from timm.utils import ModelEmaV2
+    EMA_AVAILABLE = True
+except ImportError:
+    EMA_AVAILABLE = False
+
+
+def _tta_forward(model, imgs, module_params) -> torch.Tensor:
+    """Test-Time Augmentation forward pass.
+
+    Args:
+        model: Модель для оценки
+        imgs: Тензор изображений
+        module_params: Параметры для модели
+        
+    Returns:
+        Среднее значение предсказаний
+    
+    """
+    preds = []
+    # Параметры для модели
+    text_input_ids, text_attention_mask, mass_features = module_params
+
+    # 1) Как есть
+    preds.append(model(imgs, text_input_ids,
+                 text_attention_mask, mass_features))
+
+    # 2) Горизонтальный флип
+    preds.append(model(torch.flip(
+        imgs, dims=[-1]), text_input_ids, text_attention_mask, mass_features))
+
+    # 3) Лёгкий upsample + center crop
+    up = F.interpolate(imgs, scale_factor=1.05,
+                       mode='bilinear', align_corners=False)
+    h, w = imgs.shape[-2:]
+    dh = (up.shape[-2] - h) // 2
+    dw = (up.shape[-1] - w) // 2
+    cc = up[:, :, dh:dh+h, dw:dw+w]
+    preds.append(model(cc, text_input_ids, text_attention_mask, mass_features))
+
+    return torch.mean(torch.stack(preds, dim=0), dim=0)
+
+
+@torch.no_grad()
+def evaluate_best_with_tta(model, val_loader, device) -> float:
+    """
+    Финалная оценка лучшей модели с Test-Time Augmentation.
+    
+    Args:
+        model: Лучшая модель для оценки
+        val_loader: Загрузчик валидационных данных  
+        device: Устройство для вычислений
+        
+    Returns:
+        MAE с TTA в общих калориях
+    """
+    model.eval()
+    total_mae = 0.0
+    n = 0
+
+    print("Финальная оценка с TTA...")
+
+    for batch in tqdm(val_loader, desc="Final TTA evaluation"):
+        imgs = batch['images'].to(device)
+        ids = batch['text_input_ids'].to(device)
+        attn = batch['text_attention_masks'].to(device)
+        mass = batch['masses'].to(device)
+        y100 = batch['calories_per_100g'].to(device)
+        mass_features = batch['mass_features'].to(device)
+
+        # TTA forward pass
+        yhat100 = _tta_forward(model, imgs, (ids, attn, mass_features))
+
+        # Обратная конверсия в общие калории
+        yhat = yhat100 * (mass / 100.0)
+        y = y100 * (mass / 100.0)
+
+        total_mae += F.l1_loss(yhat, y, reduction='sum').item()
+        n += y.shape[0]
+
+    return total_mae / n
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -27,6 +111,9 @@ def seed_everything(seed: int = 42) -> None:
     
     Args:
         seed: Значение seed
+
+    Returns:
+        None
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -121,7 +208,7 @@ class CaloriePredictor(nn.Module):
         # Инициализация весов
         self._initialize_weights()
     
-    def _initialize_weights(self):
+    def _initialize_weights(self) -> None:
         """Инициализация весов нового слоев."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -205,8 +292,7 @@ def create_optimizer_and_scheduler(
     
     optimizer = AdamW(param_groups, weight_decay=config['weight_decay'])
     
-    # Новый планировщик: warmup + cosine annealing без рестартов
-    import math
+    # Планировщик: warmup + cosine annealing
     warmup_epochs = config.get('warmup_epochs', 5)
     min_lr = config.get('min_lr', 1e-6)
     total_epochs = config['epochs']
@@ -214,9 +300,9 @@ def create_optimizer_and_scheduler(
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
-        # Линейное соотнесение к косинусу без рестартов
+        # Линейное соотнесение к косинусу
         t = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return 0.5 * (1 + math.cos(math.pi * t))  # от 1 до 0
+        return 0.5 * (1 + math.cos(math.pi * t))
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
@@ -227,9 +313,9 @@ def train_epoch(
     model: nn.Module,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
     device: torch.device,
-    config: Dict
+    config: Dict,
+    ema=None
 ) -> Tuple[float, float]:
     """
     Обучает модель на одной эпохе.
@@ -238,9 +324,9 @@ def train_epoch(
         model: Модель для обучения
         train_loader: Загрузчик данных для обучения
         optimizer: Оптимизатор
-        criterion: Функция потерь
         device: Устройство для вычислений
         config: Конфигурация
+        ema: EMA модель
         
     Returns:
         Tuple с средней loss и MAE для эпохи
@@ -255,7 +341,6 @@ def train_epoch(
     accumulate_steps = int(config.get('accumulate_steps', 1))
     optimizer.zero_grad()
     for batch_idx, batch in enumerate(progress_bar):
-        optimizer.zero_grad()
         
         # Перемещение данных на устройство
         images = batch['images'].to(device)
@@ -268,8 +353,7 @@ def train_epoch(
         calories_pred_per_100g = model(
             images, text_input_ids, text_attention_mask, mass_features)
         
-        # Новый лосс: MAE + 0.2*MSE для лучшей сходимости
-        import torch.nn.functional as F
+        #Лосс: MAE + 0.2*MSE для лучшей сходимости
         mae_loss = F.l1_loss(calories_pred_per_100g, calories_per_100g_true)
         mse_loss = F.mse_loss(calories_pred_per_100g, calories_per_100g_true)
         loss = mae_loss + 0.2 * mse_loss
@@ -281,6 +365,8 @@ def train_epoch(
         if (batch_idx + 1) % accumulate_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
             optimizer.zero_grad()
         
         # Статистика - конверсия в общие калории для понятных метрик
@@ -311,8 +397,8 @@ def train_epoch(
 def validate_epoch(
     model: nn.Module,
     val_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device
+    device: torch.device,
+    use_tta: bool = False
 ) -> Tuple[float, float, float]:
     """
     Валидирует модель на одной эпохе.
@@ -320,8 +406,8 @@ def validate_epoch(
     Args:
         model: Модель для валидации
         val_loader: Загрузчик данных для валидации
-        criterion: Функция потерь
         device: Устройство для вычислений
+        use_tta: Использовать TTA
         
     Returns:
         Tuple с loss, MAE и MSE для эпохи
@@ -342,9 +428,13 @@ def validate_epoch(
             masses = batch['masses'].to(device)
             mass_features = batch['mass_features'].to(device)
             
-            # Forward pass
-            calories_pred_per_100g = model(
-                images, text_input_ids, text_attention_mask, mass_features)
+            # Forward pass (с TTA или без)
+            if use_tta:
+                calories_pred_per_100g = _tta_forward(
+                    model, images, (text_input_ids, text_attention_mask, mass_features))
+            else:
+                calories_pred_per_100g = model(
+                    images, text_input_ids, text_attention_mask, mass_features)
 
             # Конвертация обратно в общие калории для валидации
             calories_pred_total = calories_pred_per_100g * (masses / 100.0)
@@ -366,8 +456,6 @@ def validate_epoch(
             total_mse += mse
     
     return total_loss / num_batches, total_mae / num_batches, total_mse / num_batches
-
-
 
 
 def train_model(
@@ -405,11 +493,18 @@ def train_model(
     # Инициализация для отслеживания лучших результатов
     best_mae = float('inf')
     best_epoch = 0
+    best_model_type = "base"
     train_losses = []
     val_losses = []
     train_maes = []
     val_maes = []
     
+    # Инициализация EMA если доступно
+    ema = None
+    if EMA_AVAILABLE:
+        ema = ModelEmaV2(model, decay=0.999)
+        print("✅ EMA модель инициализирована")
+
     # Параметры разморозки
     freeze_vision_epochs = int(config.get('freeze_vision_epochs', 0))
     freeze_text_epochs = int(config.get('freeze_text_epochs', 0))
@@ -436,14 +531,28 @@ def train_model(
         
         # ОБУЧЕНИЕ
         train_loss, train_mae = train_epoch(
-            model, train_loader, optimizer, criterion, device, config
+            model, train_loader, optimizer, device, config, ema
         )
         
-        # ВАЛИДАЦИЯ
+        # ВАЛИДАЦИЯ (сравниваем базовую модель и EMA без TTA)
+        eval_base = model
+        eval_ema = ema.module if (
+            ema is not None and hasattr(ema, "module")) else None
+
+        # Обычная валидация без TTA
         val_loss, val_mae, val_mse = validate_epoch(
-            model, val_loader, criterion, device
-        )
-        
+            eval_base, val_loader, device, use_tta=False)
+
+        # Сравнение EMA и обычной модели
+        use_ema_for_best = False
+        if eval_ema is not None:
+            val_loss_e, val_mae_e, _ = validate_epoch(
+                eval_ema, val_loader, device, use_tta=False)
+            if val_mae_e < val_mae:
+                val_loss, val_mae, val_mse = val_loss_e, val_mae_e, val_mse
+                use_ema_for_best = True
+                print("Используем EMA модель")
+
         # Обновляем learning rate
         scheduler.step()
         
@@ -472,6 +581,7 @@ def train_model(
             'best_mae': best_mae,
             'best_epoch': best_epoch,
             'is_best': False,
+            'use_ema': use_ema_for_best,
             'config': config
         }
         
@@ -479,6 +589,7 @@ def train_model(
         if val_mae < best_mae:
             best_mae = val_mae
             best_epoch = epoch
+            best_model_type = "ema" if use_ema_for_best else "base"
             checkpoint_data['is_best'] = True
             
             print(f"✅ НОВАЯ ЛУЧШАЯ МОДЕЛЬ! MAE: {val_mae:.2f} ккал")
@@ -504,9 +615,35 @@ def train_model(
     print(f"Лучшая эпоха: {best_epoch + 1}")
     print(f"Общее время обучения: {total_time/3600:.2f} часов")
     
+    # Финальная оценка лучшей модели с TTA
+    print(f"\n{'='*70}")
+    print("ФИНАЛЬНАЯ ОЦЕНКА С TTA")
+    print(f"{'='*70}")
+
+    # Определяем, какую модель использовать — EMA или базовую
+    if best_model_type == "ema" and ema is not None:
+        best_model_for_tta = ema.module
+        print("🎯 Используем EMA модель для финальной оценки")
+    else:
+        best_model_for_tta = model
+        print("🎯 Используем базовую (не EMA) модель для финальной оценки")
+
+    mae_tta = evaluate_best_with_tta(best_model_for_tta, val_loader, device)
+    print(f"\nФИНАЛЬНЫЙ РЕЗУЛЬТАТ С TTA:")
+    print(f"MAE: {mae_tta:.2f} ккал")
+
+    # Проверка достижения цели
+    target_mae = config.get('target_mae', 50)
+    if mae_tta < target_mae:
+        print(f"✅ ЦЕЛЬ ДОСТИГНУТА! {mae_tta:.2f} < {target_mae}")
+    else:
+        print(f"🎯 До цели: {mae_tta - target_mae:.2f} ккал")
+
     return {
         'best_mae': best_mae,
+        'final_mae_tta': mae_tta,
         'best_epoch': best_epoch,
+        'best_model_type': best_model_type,
         'train_losses': train_losses,
         'val_losses': val_losses,
         'train_maes': train_maes,
@@ -515,13 +652,13 @@ def train_model(
     }
 
 
-def create_checkpoint_callback(config: Dict, device: torch.device):
+def create_checkpoint_callback(config: Dict, ema=None) -> callable:
     """
     Создает функцию обратного вызова для сохранения чекпоинтов.
     
     Args:
         config: Конфигурация модели
-        device: Устройство для вычислений
+        ema: EMA модель (опционально)
         
     Returns:
         Функция callback для сохранения моделей
@@ -540,8 +677,10 @@ def create_checkpoint_callback(config: Dict, device: torch.device):
         if save_checkpoints and checkpoint_interval >= 1:
             if epoch_num % checkpoint_interval == 0:
                 epoch_model_path = os.path.join(config['output_dir'], f'model_epoch_{epoch_num:03d}.pth')
+                # Используем EMA только если она была лучшей на этой эпохе
+                model_to_save = ema.module if data.get('use_ema', False) else model
                 torch.save({
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': model_to_save.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
                     'epoch': epoch,
@@ -556,8 +695,12 @@ def create_checkpoint_callback(config: Dict, device: torch.device):
         # Сохраняем лучшую модель отдельно (всегда при улучшении MAE)
         if data['is_best']:
             best_model_path = os.path.join(config['output_dir'], 'best_model.pth')
+
+            # Используем EMA или обычную (какая лучше)
+            best_model_to_save = (ema.module if data.get('use_ema', False) else model)
+
             torch.save({
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': best_model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'epoch': epoch,
@@ -584,81 +727,67 @@ def train(
     """
     Главная функция обучения модели.
     
+    Загружает конфигурацию, данные, создает модель и вызывает основной цикл обучения.
+    
     Args:
-        config_path: Путь к файлу конфигурации
-        output_dir: Директория для сохранения модели
+        config_path: Путь к YAML файлу конфигурации
+        output_dir: Директория для сохранения моделей и логов
         
     Returns:
-        Словарь с лучшими метриками
+        Словарь с метриками лучшей модели
     """
     # Загрузка конфигурации
-    with open(config_path, 'r', encoding='utf-8') as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
-    
-    # Установка seed для воспроизводимости
-    seed_everything(config['seed'])
-    
-    # Создание директории для модели
+
+    # Инициализация
+    seed_everything(config.get("seed", 42))
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Определение устройства из конфига
-    device_setting = config.get('device', 'auto')
-    if device_setting == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    elif device_setting == 'cuda':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    elif device_setting == 'cpu':
-        device = torch.device('cpu')
+
+    # Определение устройства
+    device_setting = config.get("device", "auto")
+    if device_setting == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif device_setting == "cuda":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif device_setting == "cpu":
+        device = torch.device("cpu")
     else:
         device = torch.device(device_setting)
-        
     print(f"Используется устройство: {device}")
-    
-    # Загрузка данных из путей в конфиге
+
+    # Загрузка данных
     print("Загрузка данных...")
-    import pandas as pd
-    
-    data_paths = config.get('data_paths', {
-        'dish_csv': 'data/dish.csv',
-        'ingredients_csv': 'data/ingredients.csv',
-        'images_dir': 'data/images'
+    data_paths = config.get("data_paths", {
+        "dish_csv": "data/dish.csv",
+        "ingredients_csv": "data/ingredients.csv",
+        "images_dir": "data/images"
     })
-    
-    dish_df = pd.read_csv(data_paths['dish_csv'])
-    ingredients_df = pd.read_csv(data_paths['ingredients_csv'])
-    
-    # Создание загрузчиков данных с передачей конфига для аугментаций
+
+    dish_df = pd.read_csv(data_paths["dish_csv"])
+    ingredients_df = pd.read_csv(data_paths["ingredients_csv"])
+
     train_loader, val_loader = create_data_loaders(
         dish_df=dish_df,
         ingredients_df=ingredients_df,
-        image_dir=data_paths['images_dir'],
-        batch_size=config['batch_size'],
-        num_workers=config['num_workers'],
-        config=config  # Передаем конфиг для аугментаций и image_size
+        image_dir=data_paths["images_dir"],
+        batch_size=config["batch_size"],
+        num_workers=config["num_workers"],
+        config=config
     )
-    
-    # Создание модели
+
+    # Инициализация модели
     print("Инициализация модели...")
     model = CaloriePredictor(
-        vision_model_name=config['vision_model'],
-        text_model_name=config['text_model'],
-        hidden_dim=config['hidden_dim'],
-        dropout_rate=config['dropout_rate']
+        vision_model_name=config["vision_model"],
+        text_model_name=config["text_model"],
+        hidden_dim=config["hidden_dim"],
+        dropout_rate=config["dropout_rate"]
     ).to(device)
-    
-    # Этапная разморозка энкодеров (опционально из конфига)
-    freeze_vision_epochs = int(config.get('freeze_vision_epochs', 0))
-    freeze_text_epochs = int(config.get('freeze_text_epochs', 0))
-    if freeze_vision_epochs > 0:
-        for p in model.vision_encoder.parameters():
-            p.requires_grad = False
-    if freeze_text_epochs > 0:
-        for p in model.text_encoder.parameters():
-            p.requires_grad = False
-    
-    # Параметры разморозки
-    freeze_vision_epochs = int(config.get('freeze_vision_epochs', 0))
-    freeze_text_epochs = int(config.get('freeze_text_epochs', 0))
+
+    # Заморозка энкодеров (если указано)
+    freeze_vision_epochs = int(config.get("freeze_vision_epochs", 0))
+    freeze_text_epochs = int(config.get("freeze_text_epochs", 0))
     if freeze_vision_epochs > 0:
         for p in model.vision_encoder.parameters():
             p.requires_grad = False
@@ -668,79 +797,79 @@ def train(
             p.requires_grad = False
         print(f"Заморозили text encoder на {freeze_text_epochs} эпох")
 
-    # Создание оптимизатора и планировщика
+    # Создание оптимизатора, планировщика и функции потерь
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
+    criterion = nn.SmoothL1Loss(reduction="mean")
+
+    # Callback для сохранения чекпоинтов
+    checkpoint_callback = create_checkpoint_callback(config)
+
+    # Запуск обучения
+    print("Запуск обучения модели...")
+    training_results = train_model(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=config,
+        device=device,
+        checkpoint_callback=checkpoint_callback
+    )
+
+    print("\nОбучение завершено.")
+    print(f"Лучшая MAE: {training_results['best_mae']:.2f} ккал (эпоха {training_results['best_epoch'] + 1})")
+
+    return training_results
+
+
+def load_best_model(
+    model_class: nn.Module,
+    checkpoint_path: str,
+    device: Optional[torch.device] = None,
+) -> Tuple[nn.Module, Dict]:
+    """
+    Загружает лучшую модель из чекпоинта (best_model.pth).
     
-    # Функция потерь
-    criterion = nn.SmoothL1Loss(reduction='mean')
+    Args:
+        model_class: Класс модели (например, CaloriePredictor)
+        checkpoint_path: Путь к файлу best_model.pth
+        device: Устройство для загрузки (cuda / cpu). Если None — автоопределение.
     
-    # Обучение
-    print("Начало обучения...")
-    best_mae = float('inf')
-    best_metrics = {}
+    Returns:
+        Tuple (model, checkpoint_data)
+        model — восстановленная модель на нужном устройстве
+        checkpoint_data — словарь из чекпоинта (метрики, конфиг и т.п.)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Загрузка модели из {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Загружаем конфигурацию из чекпоинта
+    config = checkpoint.get("config", {})
     
-    for epoch in range(config['epochs']):
-        print(f"\nЭпоха {epoch + 1}/{config['epochs']}")
-        
-        # Обучение
-        train_loss, train_mae = train_epoch(
-            model, train_loader, optimizer, criterion, device, config
-        )
-        
-        # Валидация
-        val_loss, val_mae, val_mse = validate_epoch(
-            model, val_loader, criterion, device
-        )
-        
-        # Обновление learning rate
-        scheduler.step()
-        
-        print(f"Train - Loss: {train_loss:.4f}, MAE: {train_mae:.2f}")
-        print(f"Val   - Loss: {val_loss:.4f}, MAE: {val_mae:.2f}, MSE: {val_mse:.2f}")
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
-        
-        # Сохранение лучшей модели
-        if val_mae < best_mae:
-            best_mae = val_mae
-            best_metrics = {
-                'val_loss': val_loss,
-                'val_mae': val_mae,
-                'val_mse': val_mse,
-                'train_loss': train_loss,
-                'train_mae': train_mae,
-                'epoch': epoch
-            }
-            
-            # Сохранение модели
-            model_path = os.path.join(output_dir, 'best_model.pth')
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'epoch': epoch,
-                'best_mae': best_mae,
-                'config': config
-            }, model_path)
-            
-            print(f"Новая лучшая модель сохранена! MAE: {val_mae:.2f}")
-        
-        # Early stopping
-        if epoch - best_metrics['epoch'] > config['early_stopping_patience']:
-            print(f"Early stopping на эпохе {epoch + 1}")
-            break
+    # Создаем модель
+    model = model_class(
+        vision_model_name=config.get("vision_model", "efficientnet_b3"),
+        text_model_name=config.get("text_model", "distilbert-base-uncased"),
+        hidden_dim=config.get("hidden_dim", 256),
+        dropout_rate=config.get("dropout_rate", 0.3),
+    ).to(device)
     
-    print(f"\nОбучение завершено!")
-    print(f"Лучшая MAE: {best_mae:.2f}")
-    print(f"Лучшая эпоха: {best_metrics['epoch'] + 1}")
+    # Восстанавливаем веса
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    model.eval()
+
+    print(f"Модель успешно загружена (эпоха {checkpoint.get('epoch', 'N/A')})")
+    print(f"Лучший MAE: {checkpoint.get('best_mae', 'N/A')}")
     
-    return best_metrics
+    return model, checkpoint
 
 
 if __name__ == '__main__':
-    # Пример запуска
-    import sys
-    from pathlib import Path
-    
     # Добавляем корневую директорию в путь
     root_path = Path(__file__).parent.parent
     sys.path.append(str(root_path))

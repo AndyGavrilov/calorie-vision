@@ -1,75 +1,73 @@
-# Конфигурация для обучения модели предсказания калорийности блюд
-
 # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
 seed: 42
 output_dir: "models"
 device: "auto"  # auto/cuda/cpu
 
 # === МОДЕЛИ ===
-vision_model: "efficientnet_b3"  # timm model name
-text_model: "bert-base-uncased"  # transformers model name
+vision_model: "efficientnet_b3"
+text_model: "bert-base-uncased"
 
 # === АРХИТЕКТУРА ===
-hidden_dim: 768           # Увеличено для большей мощности модели
-dropout_rate: 0.3         # Уменьшено для менее агрессивной регуляризации
-image_size: 224           # Оптимальный баланс скорость/качество
+hidden_dim: 768
+dropout_rate: 0.3
+image_size: 224
 
 # === ОБУЧЕНИЕ ===
-epochs: 50               # Уменьшено для фокуса на качестве
-batch_size: 12           # Компромисс скорость/стабильность
+epochs: 30
+batch_size: 12
 num_workers: 0           # 0 для Windows, 4 для Linux
 
-# Learning rates для разных компонентов (ИСПРАВЛЕННЫЕ НАСТРОЙКИ)
-vision_lr: 0.00002        # ИСПРАВЛЕНО: было критически мало 1e-6!
-text_lr: 0.00002          # Оптимальный LR для BERT
-fusion_lr: 0.0005          # Высокий LR для новых слоев
+# Learning rates для разных компонентов
+vision_lr: 0.00002
+text_lr: 0.00002
+fusion_lr: 0.0005
 
 # === ОПТИМИЗАЦИЯ ===
-weight_decay: 0.01        # Уменьшено для менее агрессивной L2 регуляризации
-grad_clip: 1.0            # Уменьшено для менее агрессивного клиппинга градиентов
+weight_decay: 0.01
+grad_clip: 1.0
 
-# Новый планировщик Learning Rate (WARMUP + COSINE без рестартов)
+# Планировщик Learning Rate (WARMUP + COSINE)
 scheduler: "cosine"
 warmup_epochs: 5
-min_lr: 0.00000001        # Минимальный LR
+min_lr: 0.00000001
 
 # === РАННЯЯ ОСТАНОВКА ===
-early_stopping_patience: 20  # Больше терпения для длительного обучения
+early_stopping_patience: 20
 
 # === ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ ОБУЧЕНИЯ ===
-text_max_length: 128         # Сокращено для ускорения
-accumulate_steps: 2          # Уменьшено для ускорения
-freeze_vision_epochs: 5      # Больше эпох заморозки для стабильности
-freeze_text_epochs: 0        # Эпохи заморозки text encoder
+text_max_length: 128
+accumulate_steps: 2
+freeze_vision_epochs: 5
+freeze_text_epochs: 0
 
-# === АУГМЕНТАЦИИ === (УЛУЧШЕННЫЕ ПО ТЕОРИИ)
+# === АУГМЕНТАЦИИ ===
 augmentation:
   # Настройка разрешения изображений
   image_size: 224
-  # Умеренные геометрические трансформации (исправлено)
+  # Умеренные геометрические трансформации
   affine_prob: 0.3
-  affine_scale: [0.95, 1.05]         # Очень мягкий зум
-  affine_translate: [-0.03, 0.03]    # Минимальный сдвиг
+  affine_scale: [0.95, 1.05]
+  affine_translate: [-0.03, 0.03]
   
-  # Базовые аугментации (сохранены)
+  # Базовые аугментации
   horizontal_flip_prob: 0.5
   
-  # Умеренные цветовые изменения (исправлено)
-  color_jitter_brightness: 0.2       # Уменьшено с 0.4
-  color_jitter_contrast: 0.2         # Уменьшено с 0.4
-  color_jitter_saturation: 0.2       # Уменьшено с 0.4
-  color_jitter_hue: 0.05             # Уменьшено для еды
-  color_jitter_prob: 0.6             # Уменьшено
+  # Умеренные цветовые изменения
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.05
+  color_jitter_prob: 0.6
   
   # Геометрия
-  rotation_range: [-5, 5]             # Минимальные повороты
+  rotation_range: [-5, 5]
   
-  # Минимальное маскирование (для еды)
-  coarse_dropout_prob: 0.1           # Минимум дыр
-  coarse_dropout_holes_range: [1, 2] # Мало дыр
+  # Минимальное маскирование
+  coarse_dropout_prob: 0.1
+  coarse_dropout_holes_range: [1, 2]
   
-  # Убираем эластичность
-  elastic_transform_prob: 0.0         # Отключено
+  # Эластичность
+  elastic_transform_prob: 0.0
   
   # Воспроизводимость
   transform_seed: 42
@@ -85,7 +83,7 @@ target_mae: 50  # MAE должен быть меньше 50 ккал
 
 # === ЛОГИРОВАНИЕ ===
 logging:
-  log_every_n_steps: 10
+  log_every_n_steps: 20
   save_checkpoints: true
-  checkpoint_interval: 5  # сохранять чекпоинт каждые N эпох
+  checkpoint_interval: 5
 

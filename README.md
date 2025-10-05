@@ -23,6 +23,7 @@ scripts/
 .gitignore
 eda_train_eval.ipynb        # Основной ноутбук: EDA → обучение → валидация → выводы
 requirements.txt            # Зависимости проекта
+train.py                    # Скрипт для запуска обучения модели
 ```
 
 
